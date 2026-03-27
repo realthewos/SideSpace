@@ -8,7 +8,9 @@
     "storage",
     "sidePanel",
     "bookmarks",
-    "system.display"
+    "system.display",
+    "scripting",
+    "tabGroups"
   ],
   "side_panel": {
     "default_path": "sidepanel.html"

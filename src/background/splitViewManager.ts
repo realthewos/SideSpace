@@ -7,8 +7,6 @@ interface SplitViewPair {
   tabId2: string;
   chromeTabId1?: number;
   chromeTabId2?: number;
-  windowId1?: number;
-  windowId2?: number;
   createdAt: number;
 }
 
@@ -33,77 +31,26 @@ export class SplitViewManager {
         return null;
       }
 
-      // Get screen dimensions
-      let screenWidth = 1920;
-      let screenHeight = 1080;
-      let leftOffset = 0;
-      let topOffset = 0;
-
-      try {
-        const displays = await chrome.system.display.getInfo();
-        const primaryDisplay = displays.find(d => d.isPrimary) || displays[0];
-
-        if (primaryDisplay) {
-          screenWidth = primaryDisplay.workArea.width;
-          screenHeight = primaryDisplay.workArea.height;
-          leftOffset = primaryDisplay.workArea.left;
-          topOffset = primaryDisplay.workArea.top;
-        }
-      } catch (e) {
-        console.warn('Could not get display info, using defaults');
-      }
-
-      // Calculate window dimensions for split view
-      const halfWidth = Math.floor(screenWidth / 2);
-      const windowWidth = halfWidth - 10;
-      const windowHeight = screenHeight;
-
-      // Open both tabs in separate windows side by side
+      // Open first tab
       let chromeTab1: chrome.tabs.Tab | null = null;
-      let chromeTab2: chrome.tabs.Tab | null = null;
-
-      // Handle first tab
       if (tab1.chromeTabId) {
-        chromeTab1 = await this.moveTabToNewWindow(
-          tab1.chromeTabId,
-          leftOffset,
-          topOffset,
-          windowWidth,
-          windowHeight
-        );
+        try {
+          chromeTab1 = await chrome.tabs.get(tab1.chromeTabId);
+          await chrome.tabs.update(tab1.chromeTabId, { active: true });
+        } catch {
+          chromeTab1 = await chrome.tabs.create({ url: tab1.url, active: true });
+        }
       } else {
-        chromeTab1 = await this.createNewWindow(
-          tab1.url,
-          leftOffset,
-          topOffset,
-          windowWidth,
-          windowHeight
-        );
+        chromeTab1 = await chrome.tabs.create({ url: tab1.url, active: true });
       }
 
-      // Handle second tab
-      if (tab2.chromeTabId) {
-        chromeTab2 = await this.moveTabToNewWindow(
-          tab2.chromeTabId,
-          leftOffset + halfWidth,
-          topOffset,
-          windowWidth,
-          windowHeight
-        );
-      } else {
-        chromeTab2 = await this.createNewWindow(
-          tab2.url,
-          leftOffset + halfWidth,
-          topOffset,
-          windowWidth,
-          windowHeight
-        );
-      }
-
-      if (!chromeTab1 || !chromeTab2) {
-        console.error('Failed to create split view windows');
+      if (!chromeTab1 || !chromeTab1.id) {
+        console.error('Failed to open first tab');
         return null;
       }
+
+      // Inject split view UI into the first tab
+      await this.injectSplitViewUI(chromeTab1.id, tab2.url, tab2.title || tab2.url);
 
       // Create split view record
       const splitViewId = `split-${Date.now()}`;
@@ -112,9 +59,7 @@ export class SplitViewManager {
         tabId1,
         tabId2,
         chromeTabId1: chromeTab1.id,
-        chromeTabId2: chromeTab2.id,
-        windowId1: chromeTab1.windowId,
-        windowId2: chromeTab2.windowId,
+        chromeTabId2: undefined,
         createdAt: Date.now(),
       };
 
@@ -122,13 +67,8 @@ export class SplitViewManager {
       this.tabToSplitView.set(tabId1, splitViewId);
       this.tabToSplitView.set(tabId2, splitViewId);
 
-      // Update tab data directly
-      if (chromeTab1.id) {
-        await this.storageManager.updateTab(tabId1, { chromeTabId: chromeTab1.id, isOpen: true });
-      }
-      if (chromeTab2.id) {
-        await this.storageManager.updateTab(tabId2, { chromeTabId: chromeTab2.id, isOpen: true });
-      }
+      // Update tab data
+      await this.storageManager.updateTab(tabId1, { chromeTabId: chromeTab1.id, isOpen: true });
 
       return splitView;
     } catch (error) {
@@ -137,67 +77,153 @@ export class SplitViewManager {
     }
   }
 
-  private async moveTabToNewWindow(
-    tabId: number,
-    left: number,
-    top: number,
-    width: number,
-    height: number
-  ): Promise<chrome.tabs.Tab | null> {
+  private async injectSplitViewUI(tabId: number, secondUrl: string, secondTitle: string): Promise<void> {
     try {
-      const window = await chrome.windows.create({
-        tabId,
-        left,
-        top,
-        width,
-        height,
-        focused: true,
-      });
+      const tab = await chrome.tabs.get(tabId);
 
-      return window.tabs?.[0] || null;
+      // Cannot inject into chrome:// pages
+      if (tab.url?.startsWith('chrome://') || tab.url?.startsWith('chrome-extension://')) {
+        console.warn('Cannot inject split view into chrome pages');
+        return;
+      }
+
+      // Inject the split view UI
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        func: this.createSplitViewUI,
+        args: [secondUrl, secondTitle]
+      });
     } catch (error) {
-      console.error('Failed to move tab to new window:', error);
-      return null;
+      console.error('Failed to inject split view UI:', error);
     }
   }
 
-  private async createNewWindow(
-    url: string,
-    left: number,
-    top: number,
-    width: number,
-    height: number
-  ): Promise<chrome.tabs.Tab | null> {
-    try {
-      const window = await chrome.windows.create({
-        url,
-        left,
-        top,
-        width,
-        height,
-        focused: true,
-      });
-
-      return window.tabs?.[0] || null;
-    } catch (error) {
-      console.error('Failed to create new window:', error);
-      return null;
+  // This function runs in the context of the web page
+  private createSplitViewUI(url: string, title: string): void {
+    // Check if split view already exists
+    if (document.getElementById('sidespace-split-view-container')) {
+      return;
     }
+
+    // Create container
+    const container = document.createElement('div');
+    container.id = 'sidespace-split-view-container';
+    container.innerHTML = `
+      <style>
+        #sidespace-split-view-container {
+          position: fixed;
+          top: 0;
+          right: 0;
+          width: 50%;
+          height: 100vh;
+          z-index: 2147483647;
+          background: white;
+          border-left: 1px solid #ccc;
+          box-shadow: -2px 0 10px rgba(0,0,0,0.1);
+        }
+        #sidespace-split-view-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          padding: 8px 12px;
+          background: #f5f5f5;
+          border-bottom: 1px solid #ddd;
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+          font-size: 13px;
+        }
+        #sidespace-split-view-title {
+          flex: 1;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          margin: 0 10px;
+        }
+        #sidespace-split-view-close {
+          background: none;
+          border: none;
+          font-size: 18px;
+          cursor: pointer;
+          padding: 4px 8px;
+          border-radius: 4px;
+        }
+        #sidespace-split-view-close:hover {
+          background: #e0e0e0;
+        }
+        #sidespace-split-view-iframe {
+          width: 100%;
+          height: calc(100vh - 40px);
+          border: none;
+        }
+        #sidespace-split-view-resize {
+          position: absolute;
+          left: 0;
+          top: 0;
+          width: 5px;
+          height: 100%;
+          cursor: ew-resize;
+          background: transparent;
+        }
+        #sidespace-split-view-resize:hover {
+          background: #0066cc;
+        }
+      </style>
+      <div id="sidespace-split-view-header">
+        <span>📄</span>
+        <span id="sidespace-split-view-title">${title}</span>
+        <button id="sidespace-split-view-close" title="Close split view">×</button>
+      </div>
+      <iframe id="sidespace-split-view-iframe" src="${url}" sandbox="allow-same-origin allow-scripts allow-forms allow-popups"></iframe>
+      <div id="sidespace-split-view-resize"></div>
+    `;
+
+    document.body.appendChild(container);
+
+    // Handle close button
+    const closeBtn = container.querySelector('#sidespace-split-view-close');
+    closeBtn?.addEventListener('click', () => {
+      container.remove();
+    });
+
+    // Handle resize
+    const resizer = container.querySelector('#sidespace-split-view-resize') as HTMLElement;
+    let isResizing = false;
+
+    resizer?.addEventListener('mousedown', (e: MouseEvent) => {
+      isResizing = true;
+      e.preventDefault();
+    });
+
+    document.addEventListener('mousemove', (e: MouseEvent) => {
+      if (!isResizing) return;
+      const newWidth = window.innerWidth - e.clientX;
+      const percentage = Math.max(20, Math.min(80, (newWidth / window.innerWidth) * 100));
+      container.style.width = `${percentage}%`;
+    });
+
+    document.addEventListener('mouseup', () => {
+      isResizing = false;
+    });
   }
 
   async closeSplitView(splitViewId: string): Promise<void> {
     const splitView = this.splitViews.get(splitViewId);
     if (!splitView) return;
 
-    try {
-      if (splitView.windowId1) {
-        await chrome.windows.remove(splitView.windowId1);
+    // Remove split view UI from the tab
+    if (splitView.chromeTabId1) {
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: splitView.chromeTabId1 },
+          func: () => {
+            const container = document.getElementById('sidespace-split-view-container');
+            if (container) {
+              container.remove();
+            }
+          }
+        });
+      } catch {
+        // Tab might be closed
       }
-      if (splitView.windowId2) {
-        await chrome.windows.remove(splitView.windowId2);
-      }
-    } catch (error) {
-      // Windows might already be closed
     }
 
     this.splitViews.delete(splitViewId);
